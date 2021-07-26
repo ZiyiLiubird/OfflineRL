@@ -1,0 +1,9 @@
+pybullet build time: Jul 24 2021 11:13:28
+pygame 2.0.1 (SDL 2.0.14, Python 3.7.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+[32m2021-07-26 at 10:52:22.629[0m | [34mINFO[0m | Use mycode algorithm!
+Warning: Flow failed to import. Set the environment variable D4RL_SUPPRESS_IMPORT_ERROR=1 to suppress this message.
+No module named 'flow.envs'
+Warning: CARLA failed to import. Set the environment variable D4RL_SUPPRESS_IMPORT_ERROR=1 to suppress this message.
+No module named 'agents'
+load datafile:   0%|          | 0/5 [00:00<?, ?it/s]load datafile:  20%|██        | 1/5 [00:00<00:01,  3.69it/s]
