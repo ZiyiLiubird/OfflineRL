@@ -15,9 +15,10 @@ max_action = None
 dynamics_path = None
 
 hidden_layer_size = 400
-transition_layer_size = 400
 hidden_layers = 2
 transition_layers = 4
+
+max_var = 0.6
 
 transition_init_num = 7
 transition_select_num = 5
@@ -29,7 +30,7 @@ policy_batch_size = 256
 data_collection_per_epoch = 50e3
 buffer_size = 120e4
 steps_per_epoch = 1000
-max_epoch = 500
+max_epoch = 600
 
 learnable_alpha = True
 transition_lr = 1e-3
@@ -46,6 +47,7 @@ lagrange_thresh = 5
 with_important_sampling = True
 
 horizon = 5
+
 
 #tune
 params_tune = {

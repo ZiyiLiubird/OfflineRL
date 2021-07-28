@@ -1,16 +1,8 @@
 # COMBO: Conservative Offline Model-Based Policy Optimization
 # http://arxiv.org/abs/2102.08363
 # No available code
-#*******************************修改内容**********************************#
-# 1. 更改了transition_layer_size = 200, 保持与论文中的一致 done
-# 2. 加入ensemble method to estimate uncertainty, change model's loss function
-#    尚未完成
-# 3. 将model_buffer中的数据按照uncertainty进行划分，uncertainty程度大的数据利用CQL方法
-#    做penalty
-#
-#
-#
 
+import struct
 import torch
 import numpy as np
 from copy import deepcopy
@@ -26,7 +18,7 @@ from offlinerl.utils.data import ModelBuffer
 from offlinerl.utils.net.model.ensemble import EnsembleTransition
 
 def algo_init(args):
-    logger.info('Run algo_init function!!')
+    logger.info('Run algo_init function')
 
     setup_seed(args['seed'])
     
@@ -41,7 +33,7 @@ def algo_init(args):
 
     args['target_entropy'] = - float(np.prod(action_shape))
     
-    transition = EnsembleTransition(obs_shape, action_shape, args['transition_layer_size'], args['transition_layers'], args['transition_init_num']).to(args['device'])
+    transition = EnsembleTransition(obs_shape, action_shape, args['hidden_layer_size'], args['transition_layers'], args['transition_init_num']).to(args['device'])
     transition_optim = torch.optim.Adam(transition.parameters(), lr=args['transition_lr'], weight_decay=0.000075)
 
     net_a = Net(layer_num=args['hidden_layers'], 
@@ -99,8 +91,8 @@ class AlgoTrainer(BaseAlgo):
         self.log_beta_optim = algo_init['log_beta']['opt']
 
         self.device = args['device']
+        self.max_var = args['max_var']
         logger.info("device:{}".format(self.device))
-
         
     def train(self, train_buffer, val_buffer, callback_fn):
         if self.args['dynamics_path'] is not None:
@@ -108,7 +100,7 @@ class AlgoTrainer(BaseAlgo):
         else:
             logger.info('enter dynamics training...')
             self.train_transition(train_buffer)
-        self.transition.requires_grad_(False)
+        self.transition.requires_grad_(False)   
         policy = self.train_policy(train_buffer, val_buffer, self.transition, callback_fn)
     
     def get_policy(self):
@@ -137,7 +129,7 @@ class AlgoTrainer(BaseAlgo):
                 batch = train_buffer[batch_idxs]
                 self._train_transition(self.transition, batch, self.transition_optim)
             new_val_losses, var = self._eval_transition(self.transition, valdata)
-            print("new val losses: {}".format(new_val_losses))
+            print(new_val_losses)
             print("var: {}".format(var))
 
             indexes = []
@@ -163,9 +155,8 @@ class AlgoTrainer(BaseAlgo):
 
     def train_policy(self, train_buffer, val_buffer, transition, callback_fn):
         real_batch_size = int(self.args['policy_batch_size'] * self.args['real_data_ratio'])
-        # model_batch_size = self.args['policy_batch_size']  - real_batch_size
-        model_batch_size = real_batch_size
-    
+        model_batch_size = self.args['policy_batch_size']  - real_batch_size
+        
         model_buffer = ModelBuffer(self.args['buffer_size'])
 
         for epoch in range(self.args['max_epoch']):
@@ -180,6 +171,7 @@ class AlgoTrainer(BaseAlgo):
                     next_obses = next_obs_dists.sample()
                     rewards = next_obses[:, :, -1:]
                     next_obses = next_obses[:, :, :-1]
+                    next_obses_var = next_obs_dists.variance[:, :, :-1]
 
                     next_obses_mode = next_obs_dists.mean[:, :, :-1]
                     next_obs_mean = torch.mean(next_obses_mode, dim=0)
@@ -187,7 +179,13 @@ class AlgoTrainer(BaseAlgo):
                     disagreement_uncertainty = torch.max(torch.norm(diff, dim=-1, keepdim=True), dim=0)[0]
                     aleatoric_uncertainty = torch.max(torch.norm(next_obs_dists.stddev, dim=-1, keepdim=True), dim=0)[0]
 
-                    model_indexes = np.random.randint(0, next_obses.shape[0], size=(obs.shape[0]))
+                    # mycodes
+                    mean_next_obses_var = next_obses_var.mean(dim=-1)
+                    model_indexes = mean_next_obses_var.argmin(dim=0)
+                    var = mean_next_obses_var[model_indexes, np.arange(obs.shape[0])]
+                    # mycodes
+
+                    #model_indexes = np.random.randint(0, next_obses.shape[0], size=(obs.shape[0]))
                     next_obs = next_obses[model_indexes, np.arange(obs.shape[0])]
                     reward = rewards[model_indexes, np.arange(obs.shape[0])]
                     
@@ -201,6 +199,7 @@ class AlgoTrainer(BaseAlgo):
                         "rew" : reward.cpu(),
                         "done" : dones.cpu(),
                         "obs_next" : next_obs.cpu(),
+                        "var" : var.cpu(),
                     })
 
                     model_buffer.put(batch_data)
@@ -209,18 +208,13 @@ class AlgoTrainer(BaseAlgo):
 
             # update
             for _ in range(self.args['steps_per_epoch']):
-                offbatch = train_buffer.sample(real_batch_size)
-                #*****#
-                #offbatch['var'] = None
-                #*****#
+                batch = train_buffer.sample(real_batch_size)
                 model_batch = model_buffer.sample(model_batch_size)
-                batch = Batch.cat([offbatch, model_batch], axis=0)
+                # batch = Batch.cat([batch, model_batch], axis=0)
                 batch.to_torch(device=self.device)
-                model_batch = Batch.cat([model_batch], axis=0).to_torch(device=self.device)
-                #offbatch = Batch.cat([offbatch], axis=0).to_torch(device=self.device)
-                offbatch = offbatch.to_torch(device=self.device)
+                model_batch = model_batch.to_torch(device=self.device)
 
-                self._cql_update(batch, offbatch=offbatch, model_batch=model_batch)
+                self._cql_update(batch, model_batch, transition)
 
             res = callback_fn(self.get_policy())
             
@@ -232,29 +226,36 @@ class AlgoTrainer(BaseAlgo):
 
         return self.get_policy()
 
-    def _cql_update(self, batch_data, offbatch=None, model_batch=None):
-        obs = batch_data['obs']
-        action = batch_data['act']
-        next_obs = batch_data['obs_next']
-        reward = batch_data['rew']
-        done = batch_data['done']
-        batch_size = done.shape[0]
+    def _uw_update(self, batch_data, model_data):
+        pass
 
-        ''' offline data'''
-        off_obs = offbatch['obs']
-        off_action = offbatch['act']
-        off_next_obs = offbatch['obs_next']
-        off_reward = offbatch['rew']
-        off_done = offbatch['done']
+    def _cql_update(self, batch_data, model_data, transition):
+        off_obs = batch_data['obs']
+        off_action = batch_data['act']
+        off_next_obs = batch_data['obs_next']
+        off_reward = batch_data['rew']
+        off_done = batch_data['done']
         off_batch_size = off_done.shape[0]
 
-        '''model data'''
-        m_obs = model_batch['obs']
-        m_action = model_batch['act']
-        m_next_obs = model_batch['obs_next']
-        m_reward = model_batch['rew']
-        m_done = model_batch['done']
+        m_obs = model_data['obs']
+        m_action = model_data['act']
+        m_next_obs = model_data['obs_next']
+        m_reward = model_data['rew']
+        m_done = model_data['done']
         m_batch_size = m_done.shape[0]
+
+        m_obs_action_var = model_data['var']
+        indices_small = m_obs_action_var < self.max_var
+        indices_large = m_obs_action_var >= self.max_var
+
+        obs = torch.cat([off_obs, m_obs[indices_small]], dim=0)
+        action = torch.cat([off_action, m_action[indices_small]], dim=0)
+        next_obs = torch.cat([off_next_obs, m_next_obs[indices_small]], dim=0)
+        reward = torch.cat([off_reward, m_reward[indices_small]], dim=0)
+        done = torch.cat([off_done, m_done[indices_small]], dim=0)
+        batch_size = done.shape[0]
+
+
 
         '''update critic'''
 
@@ -263,69 +264,91 @@ class AlgoTrainer(BaseAlgo):
         _q1 = self.q1(obs_action)
         _q2 = self.q2(obs_action)
 
+        all_obs = torch.cat([off_obs, m_obs], dim=0)
+        all_actions = torch.cat([off_action, m_action], dim=0)
+        all_next_obs = torch.cat([off_next_obs, m_next_obs])
+        all_rewards = torch.cat([off_reward, m_reward], dim=0)
+        all_done = torch.cat([off_done, m_done], dim=0)
+        all_obs_action = torch.cat([all_obs, all_actions], dim=-1)
+        q1_val = self.q1(all_obs_action)
+        q2_val = self.q2(all_obs_action)
+
+
         with torch.no_grad():
-            next_action_dist = self.actor(next_obs)
+            next_action_dist = self.actor(all_next_obs)
             next_action = next_action_dist.sample()
             log_prob = next_action_dist.log_prob(next_action).sum(dim=-1, keepdim=True)
-            next_obs_action = torch.cat([next_obs, next_action], dim=-1)
+            next_obs_action = torch.cat([all_next_obs, next_action], dim=-1)
             _target_q1 = self.target_q1(next_obs_action)
             _target_q2 = self.target_q2(next_obs_action)
             alpha = torch.exp(self.log_alpha)
-            y = reward + self.args['discount'] * (1 - done) * (torch.min(_target_q1, _target_q2) - alpha * log_prob)
+            y = all_rewards + self.args['discount'] * (1 - all_done) * (torch.min(_target_q1, _target_q2) - alpha * log_prob)
 
-        critic_loss = ((y - _q1) ** 2).mean() + ((y - _q2) ** 2).mean()
-
-        # calculate q value from offline dataset
-        off_obs_action = torch.cat([off_obs, off_action], dim=-1)
-        off_q1 = self.q1(off_obs_action)
-        off_q2 = self.q2(off_obs_action)
+        critic_loss = ((y - q1_val) ** 2).mean() + ((y - q2_val) ** 2).mean()
 
         # attach the value penalty term
-        
-        random_actions = torch.rand(self.args['num_samples'], batch_size, action.shape[-1]).to(action) * 2 - 1
-        action_dist = self.actor(obs)
+        all_obs = torch.cat([off_obs, m_obs], dim=0)
+        all_next_obs = torch.cat([off_next_obs, m_next_obs], dim=0)
+        all_sampled_action_dist = self.actor(all_obs)
+        all_sampled_actions = all_sampled_action_dist.sample()
+        all_obs_action = torch.cat([all_obs, all_sampled_actions], dim=-1)
+        next_all_obs_dist = transition(all_obs_action)
+        all_vars = next_all_obs_dist.variance[:, :, :-1].mean(dim=-1)
+        model_indexes = all_vars.argmin(dim=0)
+        all_var = all_vars[model_indexes, np.arange(all_obs.shape[0])]
+        obs_indices = all_var > self.max_var
+
+        all_sampled_next_action_dist = self.actor(all_next_obs)
+        all_sampled_next_actions = all_sampled_next_action_dist.sample()
+        all_next_obs_actions = torch.cat([all_next_obs, all_sampled_next_actions], dim=-1)
+        next_all_next_obs_dist = transition(all_next_obs_actions)
+        all_next_vars = next_all_next_obs_dist.variance[:, :, :-1].mean(dim=-1)
+        model_indexes = all_next_vars.argmin(dim=0)
+        all_next_var = all_next_vars[model_indexes, np.arange(all_next_obs.shape[0])]
+        next_obs_indices = all_next_var > self.max_var
+
+        total_num = torch.min(obs_indices.sum(), next_obs_indices.sum())
+
+        random_actions = torch.rand(self.args['num_samples'], total_num, action.shape[-1]).to(action) * 2 - 1
+
+        action_dist = self.actor(all_obs[obs_indices][:total_num])
         sampled_actions = torch.stack([action_dist.rsample() for _ in range(self.args['num_samples'])], dim=0)
 
-        random_next_actions = torch.rand(self.args['num_samples'], batch_size, action.shape[-1]).to(action) * 2 - 1
-        next_action_dist = self.actor(next_obs)
+        random_next_actions = torch.rand(self.args['num_samples'], total_num, action.shape[-1]).to(action) * 2 - 1
+        
+        #*******************
+        #all_next_obs = torch.cat([next_obs, m_next_obs[indices_large]])
+        next_action_dist = self.actor(all_next_obs[next_obs_indices][:total_num])
         sampled_next_actions = torch.stack([next_action_dist.rsample() for _ in range(self.args['num_samples'])], dim=0)
+        
+
+
+        #*******************
 
         sampled_actions = torch.cat([random_actions, sampled_actions], dim=0)
-        repeated_obs = torch.repeat_interleave(obs.unsqueeze(0), sampled_actions.shape[0], 0)
+        repeated_obs = torch.repeat_interleave(all_obs[obs_indices][:total_num].unsqueeze(0), sampled_actions.shape[0], 0)
         sampled_q1 = self.q1(torch.cat([repeated_obs, sampled_actions], dim=-1))
         sampled_q2 = self.q2(torch.cat([repeated_obs, sampled_actions], dim=-1))
 
         sampled_next_actions = torch.cat([random_next_actions, sampled_next_actions], dim=0)
-        repeated_next_obs = torch.repeat_interleave(next_obs.unsqueeze(0), sampled_next_actions.shape[0], 0)
+        repeated_next_obs = torch.repeat_interleave(all_next_obs[next_obs_indices][:total_num].unsqueeze(0), sampled_next_actions.shape[0], 0)
         sampled_next_q1 = self.q1(torch.cat([repeated_next_obs, sampled_next_actions], dim=-1))
         sampled_next_q2 = self.q2(torch.cat([repeated_next_obs, sampled_next_actions], dim=-1))
 
         sampled_q1 = torch.cat([sampled_q1, sampled_next_q1], dim=0)
         sampled_q2 = torch.cat([sampled_q2, sampled_next_q2], dim=0)
-        
-        # MYCODES
-        '''
-        action_dist = self.actor(m_obs)
-        sampled_actions = torch.stack([action_dist.rsample() for _ in range(self.args['num_samples'])], dim=0)
-        
-        next_action_dist = self.actor(m_next_obs)
-        '''
-
 
         if self.args['with_important_sampling']:
             # perform important sampling
-            _random_log_prob = torch.ones(self.args['num_samples'], batch_size, 1).to(sampled_q1) * action.shape[-1] * np.log(0.5)
+            _random_log_prob = torch.ones(self.args['num_samples'], total_num, 1).to(sampled_q1) * action.shape[-1] * np.log(0.5)
             _log_prob = action_dist.log_prob(sampled_actions[self.args['num_samples']:]).sum(dim=-1, keepdim=True)
-            # test
-            #print('*****')
             _next_log_prob = next_action_dist.log_prob(sampled_next_actions[self.args['num_samples']:]).sum(dim=-1, keepdim=True)
-            #print('done......')
             is_weight = torch.cat([_random_log_prob, _log_prob, _random_log_prob, _next_log_prob], dim=0)
             sampled_q1 = sampled_q1 - is_weight
             sampled_q2 = sampled_q2 - is_weight
 
-        q1_penalty = (torch.logsumexp(sampled_q1, dim=0).mean() - off_q1.mean()) * self.args['base_beta']
-        q2_penalty = (torch.logsumexp(sampled_q2, dim=0).mean() - off_q2.mean()) * self.args['base_beta']
+        q1_penalty = (torch.logsumexp(sampled_q1, dim=0).mean() - _q1.mean()) * self.args['base_beta']
+        q2_penalty = (torch.logsumexp(sampled_q2, dim=0).mean() - _q2.mean()) * self.args['base_beta']
 
         if self.args['learnable_beta']:
             # update beta
@@ -377,18 +400,12 @@ class AlgoTrainer(BaseAlgo):
         selected_indexes = [pairs[i][1] for i in range(n)]
         return selected_indexes
 
-    def NLL(self,value, mu, var):
-        """ Negative log-likelihood loss function. """
-        return (0.5 * torch.log(var) + 0.5 * ((value - mu).pow(2) / var)).mean() + 5
-
     def _train_transition(self, transition, data, optim):
         #logger.info('_train_transition...')
         data.to_torch(device=self.device)
         dist = transition(torch.cat([data['obs'], data['act']], dim=-1))
-        #mu, var = transition(torch.cat([data['obs'], data['act']], dim=-1))
         loss = - dist.log_prob(torch.cat([data['obs_next'], data['rew']], dim=-1))
         loss = loss.mean()
-        #loss = self.NLL(torch.cat([data['obs'], data['act']], dim=-1), mu, var)
 
         loss = loss + 0.01 * transition.max_logstd.mean() - 0.01 * transition.min_logstd.mean()
 
@@ -400,6 +417,6 @@ class AlgoTrainer(BaseAlgo):
         with torch.no_grad():
             valdata.to_torch(device=self.device)
             dist = transition(torch.cat([valdata['obs'], valdata['act']], dim=-1))
-            #mu, var = transition(torch.cat([valdata['obs'], valdata['act']], dim=-1))
             loss = ((dist.mean - torch.cat([valdata['obs_next'], valdata['rew']], dim=-1)) ** 2).mean(dim=(1,2))
-            return list(loss.cpu().numpy()), dist.variance.mean(dim=(1,2))
+            var = dist.variance.mean(dim=(1,2))
+            return list(loss.cpu().numpy()), var
